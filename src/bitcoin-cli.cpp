@@ -379,7 +379,7 @@ public:
 class NetinfoRequestHandler : public BaseRequestHandler
 {
 private:
-    static constexpr uint8_t MAX_DETAIL_LEVEL{4};
+    static constexpr uint8_t MAX_DETAIL_LEVEL{5};
     std::array<std::array<uint16_t, NETWORKS.size() + 1>, 3> m_counts{{{}}}; //!< Peer counts by (in/out/total, networks/total)
     uint8_t m_block_relay_peers_count{0};
     uint8_t m_manual_peers_count{0};
@@ -391,9 +391,10 @@ private:
         return UNKNOWN_NETWORK;
     }
     uint8_t m_details_level{0}; //!< Optional user-supplied arg to set dashboard details level
-    bool DetailsRequested() const { return m_details_level > 0 && m_details_level < 5; }
-    bool IsAddressSelected() const { return m_details_level == 2 || m_details_level == 4; }
-    bool IsVersionSelected() const { return m_details_level == 3 || m_details_level == 4; }
+    bool DetailsRequested() const { return m_details_level > 0 && m_details_level <= MAX_DETAIL_LEVEL; }
+    bool IsAddressSelected() const { return m_details_level == 2 || m_details_level >= 4; }
+    bool IsVersionSelected() const { return m_details_level >= 3; }
+    bool OutboundOnlySelected() const { return m_details_level == 5; }
     bool m_is_asmap_on{false};
     size_t m_max_addr_length{0};
     size_t m_max_addr_processed_length{5};
@@ -477,7 +478,7 @@ public:
         if (!args.empty()) {
             uint8_t n{0};
             if (ParseUInt8(args.at(0), &n)) {
-                m_details_level = std::min(n, MAX_DETAIL_LEVEL);
+                m_details_level = (n <= MAX_DETAIL_LEVEL) ? n : 4;
             } else {
                 throw std::runtime_error(strprintf("invalid -netinfo argument: %s\nFor more information, run: bitcoin-cli -netinfo help", args.at(0)));
             }
@@ -514,6 +515,7 @@ public:
             ++m_counts.at(2).at(NETWORKS.size());           // total overall
             if (conn_type == "block-relay-only") ++m_block_relay_peers_count;
             if (conn_type == "manual") ++m_manual_peers_count;
+            if (!is_outbound && OutboundOnlySelected()) continue;
             if (DetailsRequested()) {
                 // Push data for this peer to the peers vector.
                 const int peer_id{peer["id"].getInt<int>()};
@@ -664,6 +666,7 @@ public:
         "                                  2 - Like 1 but with an address column\n"
         "                                  3 - Like 1 but with a version column\n"
         "                                  4 - Like 1 but with both address and version columns\n"
+        "                                  5 - Like 4 but limited to outbound peers only, to save screen space\n"
         "2. help (string \"help\", optional) Print this help documentation instead of the dashboard.\n\n"
         "Result:\n\n"
         + strprintf("* The peers listing in levels 1-%d displays all of the peers sorted by direction and minimum ping time:\n\n", MAX_DETAIL_LEVEL) +
