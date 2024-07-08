@@ -38,7 +38,7 @@ Sv2TemplateProvider::Sv2TemplateProvider(interfaces::Mining& mining) : m_mining{
     m_connman = std::make_unique<Sv2Connman>(TP_SUBPROTOCOL, static_key, m_authority_pubkey, certificate);
 
     // Suppress unused variable warning, result is unused.
-    m_mining.getTipHash();
+    m_mining.getTip();
 }
 
 bool Sv2TemplateProvider::Start(const Sv2TemplateProviderOptions& options)
