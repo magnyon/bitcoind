@@ -8,6 +8,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <common/args.h>
+#include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
 #include <external_signer.h>
@@ -17,6 +18,7 @@
 #include <interfaces/handler.h>
 #include <interfaces/mining.h>
 #include <interfaces/node.h>
+#include <interfaces/types.h>
 #include <interfaces/wallet.h>
 #include <kernel/chain.h>
 #include <kernel/context.h>
@@ -33,6 +35,7 @@
 #include <node/interface_ui.h>
 #include <node/mini_miner.h>
 #include <node/miner.h>
+#include <node/kernel_notifications.h>
 #include <node/transaction.h>
 #include <node/types.h>
 #include <node/warnings.h>
@@ -67,6 +70,7 @@
 
 #include <boost/signals2/signal.hpp>
 
+using interfaces::BlockRef;
 using interfaces::BlockTemplate;
 using interfaces::BlockTip;
 using interfaces::Chain;
@@ -137,7 +141,7 @@ public:
         // Stop RPC for clean shutdown if any of waitfor* commands is executed.
         if (args().GetBoolArg("-server", false)) {
             InterruptRPC();
-            StopRPC();
+            StopRPC(m_context);
         }
     }
     bool shutdownRequested() override { return ShutdownRequested(*Assert(m_context)); };
@@ -867,7 +871,7 @@ public:
 class BlockTemplateImpl : public BlockTemplate
 {
 public:
-    explicit BlockTemplateImpl(std::unique_ptr<CBlockTemplate> block_template) : m_block_template(std::move(block_template))
+    explicit BlockTemplateImpl(std::unique_ptr<CBlockTemplate> block_template, NodeContext& node) : m_block_template(std::move(block_template)), m_node(node)
     {
         assert(m_block_template);
     }
@@ -907,7 +911,37 @@ public:
         return GetWitnessCommitmentIndex(m_block_template->block);
     }
 
+    std::vector<uint256> getCoinbaseMerklePath() override
+    {
+        return BlockMerkleBranch(m_block_template->block);
+    }
+
+    bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CMutableTransaction coinbase) override
+    {
+        CBlock block{m_block_template->block};
+
+        auto cb = MakeTransactionRef(std::move(coinbase));
+
+        if (block.vtx.size() == 0) {
+            block.vtx.push_back(cb);
+        } else {
+            block.vtx[0] = cb;
+        }
+
+        block.nVersion = version;
+        block.nTime = timestamp;
+        block.nNonce = nonce;
+
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+
+        auto block_ptr = std::make_shared<const CBlock>(block);
+        return chainman().ProcessNewBlock(block_ptr, /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/nullptr);
+    }
+
     const std::unique_ptr<CBlockTemplate> m_block_template;
+
+    ChainstateManager& chainman() { return *Assert(m_node.chainman); }
+    NodeContext& m_node;
 };
 
 class MinerImpl : public Mining
@@ -925,12 +959,55 @@ public:
         return chainman().IsInitialBlockDownload();
     }
 
-    std::optional<uint256> getTipHash() override
+    std::optional<BlockRef> getTip() override
     {
         LOCK(::cs_main);
         CBlockIndex* tip{chainman().ActiveChain().Tip()};
         if (!tip) return {};
-        return tip->GetBlockHash();
+        return BlockRef{tip->GetBlockHash(), tip->nHeight};
+    }
+
+    BlockRef waitTipChanged(uint256 current_tip, MillisecondsDouble timeout) override
+    {
+        // Interrupt check interval
+        const MillisecondsDouble tick{1000};
+        auto now{std::chrono::steady_clock::now()};
+        auto deadline = now + timeout;
+        // std::chrono does not check against overflow
+        if (deadline < now) deadline = std::chrono::steady_clock::time_point::max();
+        {
+            WAIT_LOCK(notifications().m_tip_block_mutex, lock);
+            while ((notifications().m_tip_block == uint256() || notifications().m_tip_block == current_tip) && !chainman().m_interrupt) {
+                now = std::chrono::steady_clock::now();
+                if (now >= deadline) break;
+                notifications().m_tip_block_cv.wait_until(lock, std::min(deadline, now + tick));
+            }
+        }
+        // Must release m_tip_block_mutex before locking cs_main, to avoid deadlocks.
+        LOCK(::cs_main);
+        return BlockRef{chainman().ActiveChain().Tip()->GetBlockHash(), chainman().ActiveChain().Tip()->nHeight};
+    }
+
+    bool waitFeesChanged(MillisecondsDouble timeout, uint256 tip, CAmount fee_delta, CAmount& fees_before, bool& tip_changed) override
+    {
+        Assume(getTip());
+        unsigned int last_mempool_update{context()->mempool->GetTransactionsUpdated()};
+
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        {
+            while (!chainman().m_interrupt && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::min(timeout, MillisecondsDouble(100)));
+                if (getTip().value().hash != tip) {
+                    tip_changed = true;
+                    return false;
+                }
+
+                // TODO: when cluster mempool is available, actually calculate
+                // fees for the next block. This is currently too expensive.
+                if (context()->mempool->GetTransactionsUpdated() > last_mempool_update) return true;
+            }
+        }
+        return false;
     }
 
     bool processNewBlock(const std::shared_ptr<const CBlock>& block, bool* new_block) override
@@ -960,11 +1037,12 @@ public:
     {
         BlockAssembler::Options assemble_options{options};
         ApplyArgsManOptions(*Assert(m_node.args), assemble_options);
-        return std::make_unique<BlockTemplateImpl>(BlockAssembler{chainman().ActiveChainstate(), context()->mempool.get(), assemble_options}.CreateNewBlock(script_pub_key));
+        return std::make_unique<BlockTemplateImpl>(BlockAssembler{chainman().ActiveChainstate(), context()->mempool.get(), assemble_options}.CreateNewBlock(script_pub_key), m_node);
     }
 
     NodeContext* context() override { return &m_node; }
     ChainstateManager& chainman() { return *Assert(m_node.chainman); }
+    KernelNotifications& notifications() { return *Assert(m_node.notifications); }
     NodeContext& m_node;
 };
 } // namespace

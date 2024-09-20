@@ -54,6 +54,9 @@
 #include <node/mempool_persist_args.h>
 #include <node/miner.h>
 #include <node/peerman_args.h>
+#ifdef WITH_SV2
+#include <sv2/template_provider.h>
+#endif
 #include <policy/feerate.h>
 #include <policy/fees.h>
 #include <policy/fees_args.h>
@@ -259,6 +262,11 @@ void Interrupt(NodeContext& node)
     InterruptRPC();
     InterruptREST();
     InterruptTorControl();
+#ifdef WITH_SV2
+    if (node.sv2_template_provider) {
+        node.sv2_template_provider->Interrupt();
+    }
+#endif
     InterruptMapPort();
     if (node.connman)
         node.connman->Interrupt();
@@ -284,7 +292,7 @@ void Shutdown(NodeContext& node)
 
     StopHTTPRPC();
     StopREST();
-    StopRPC();
+    StopRPC(&node);
     StopHTTPServer();
     for (const auto& client : node.chain_clients) {
         client->flush();
@@ -297,6 +305,11 @@ void Shutdown(NodeContext& node)
     if (node.connman) node.connman->Stop();
 
     StopTorControl();
+
+#ifdef WITH_SV2
+    // Stop Template Provider
+    if (node.sv2_template_provider) node.sv2_template_provider->StopThreads();
+#endif
 
     if (node.background_init_thread.joinable()) node.background_init_thread.join();
     // After everything has been shut down, but before things get flushed, stop the
@@ -311,6 +324,9 @@ void Shutdown(NodeContext& node)
     node.banman.reset();
     node.addrman.reset();
     node.netgroupman.reset();
+#ifdef WITH_SV2
+    node.sv2_template_provider.reset();
+#endif
 
     if (node.mempool && node.mempool->GetLoadTried() && ShouldPersistMempool(*node.args)) {
         DumpMempool(*node.mempool, MempoolPath(*node.args));
@@ -428,20 +444,6 @@ static void registerSignalHandler(int signal, void(*handler)(int))
     sigaction(signal, &sa, nullptr);
 }
 #endif
-
-static boost::signals2::connection rpc_notify_block_change_connection;
-static void OnRPCStarted()
-{
-    rpc_notify_block_change_connection = uiInterface.NotifyBlockTip_connect(std::bind(RPCNotifyBlockChange, std::placeholders::_2));
-}
-
-static void OnRPCStopped()
-{
-    rpc_notify_block_change_connection.disconnect();
-    RPCNotifyBlockChange(nullptr);
-    g_best_block_cv.notify_all();
-    LogDebug(BCLog::RPC, "RPC stopped.\n");
-}
 
 void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 {
@@ -661,6 +663,11 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blockmaxweight=<n>", strprintf("Set maximum BIP141 block weight (default: %d)", DEFAULT_BLOCK_MAX_WEIGHT), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockmintxfee=<amt>", strprintf("Set lowest fee rate (in %s/kvB) for transactions to be included in block creation. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_BLOCK_MIN_TX_FEE)), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockversion=<n>", "Override block version to test forking scenarios", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::BLOCK_CREATION);
+#ifdef WITH_SV2
+    argsman.AddArg("-sv2", "Bitcoind will act as a Stratum v2 Template Provider, see doc/stratum-v2.md (default: false)", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-sv2interval", strprintf("Template Provider block template update interval (default: %d seconds)", Sv2TemplateProviderOptions().fee_check_interval.count()), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-sv2feedelta", strprintf("Minimum fee delta for Template Provider to send update upstream (default: %d sat)", uint64_t(Sv2TemplateProviderOptions().fee_delta)), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+#endif
 
     argsman.AddArg("-rest", strprintf("Accept public REST requests (default: %u)", DEFAULT_REST_ENABLE), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcallowip=<ip>", "Allow JSON-RPC connections from specified source. Valid values for <ip> are a single IP (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0), a network/CIDR (e.g. 1.2.3.4/24), all ipv4 (0.0.0.0/0), or all ipv6 (::/0). This option can be specified multiple times", ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
@@ -681,6 +688,11 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     if (can_listen_ipc) {
         argsman.AddArg("-ipcbind=<address>", "Bind to Unix socket address and listen for incoming connections. Valid address values are \"unix\" to listen on the default path, <datadir>/node.sock, or \"unix:/custom/path\" to specify a custom path. Can be specified multiple times to listen on multiple paths. Default behavior is not to listen on any path. If relative paths are specified, they are interpreted relative to the network data directory. If paths include any parent directory components and the parent directories do not exist, they will be created.", ArgsManager::ALLOW_ANY, OptionsCategory::IPC);
     }
+
+#ifdef WITH_SV2
+    argsman.AddArg("-sv2bind=<addr>[:<port>]", strprintf("Bind to given address and always listen on it (default: 127.0.0.1). Use [host]:port notation for IPv6."), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-sv2port=<port>", strprintf("Listen for Stratum v2 connections on <port> (default: %u, testnet: %u, signet: %u, regtest: %u)", defaultBaseParams->Sv2Port(), testnetBaseParams->Sv2Port(), signetBaseParams->Sv2Port(), regtestBaseParams->Sv2Port()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+#endif
 
 #if HAVE_DECL_FORK
     argsman.AddArg("-daemon", strprintf("Run in the background as a daemon and accept commands (default: %d)", DEFAULT_DAEMON), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -723,8 +735,6 @@ static void StartupNotify(const ArgsManager& args)
 static bool AppInitServers(NodeContext& node)
 {
     const ArgsManager& args = *Assert(node.args);
-    RPCServer::OnStarted(&OnRPCStarted);
-    RPCServer::OnStopped(&OnRPCStopped);
     if (!InitHTTPServer(*Assert(node.shutdown))) {
         return false;
     }
@@ -1342,6 +1352,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         {"-onion",                  true},
         {"-proxy",                  true},
         {"-rpcbind",                false},
+#ifdef WITH_SV2
+        {"-sv2bind",                false},
+#endif
         {"-torcontrol",             false},
         {"-whitebind",              false},
         {"-zmqpubhashblock",        true},
@@ -2005,17 +2018,55 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         return false;
     }
 
+#ifdef WITH_SV2
+    if (args.GetBoolArg("-sv2", false)) {
+        assert(!node.sv2_template_provider);
+        assert(node.mining);
+
+        Sv2TemplateProviderOptions options{};
+
+        node.sv2_template_provider = std::make_unique<Sv2TemplateProvider>(*node.mining);
+
+        const std::string sv2_port_arg = args.GetArg("-sv2port", "");
+
+        if (sv2_port_arg.empty()) {
+            options.port = BaseParams().Sv2Port();
+        } else {
+            if (!ParseUInt16(sv2_port_arg, &options.port) || options.port == 0) {
+                return InitError(InvalidPortErrMsg("sv2port", sv2_port_arg));
+            }
+        }
+
+        if (gArgs.IsArgSet("-sv2bind")) { // Specific bind address
+            std::optional<std::string> sv2_bind{gArgs.GetArg("-sv2bind")};
+            if (sv2_bind) {
+                if (!SplitHostPort(sv2_bind.value(), options.port, options.host)) {
+                    throw std::runtime_error(strprintf("Invalid port %d", options.port));
+                }
+            }
+        }
+
+        options.fee_delta = gArgs.GetIntArg("-sv2feedelta", Sv2TemplateProviderOptions().fee_delta);
+
+        if (gArgs.IsArgSet("-sv2interval")) {
+            if (args.GetIntArg("-sv2interval", 0) < 1) {
+                return InitError(Untranslated("-sv2interval must be at least one second"));
+            }
+            options.fee_check_interval = std::chrono::seconds(gArgs.GetIntArg("-sv2interval", 0));
+        }
+
+        if (!node.sv2_template_provider->Start(options)) {
+            return InitError(_("Unable to start Stratum v2 Template Provider"));
+        }
+    }
+#endif
+
     // ********************************************************* Step 13: finished
 
     // At this point, the RPC is "started", but still in warmup, which means it
     // cannot yet be called. Before we make it callable, we need to make sure
     // that the RPC's view of the best block is valid and consistent with
     // ChainstateManager's active tip.
-    //
-    // If we do not do this, RPC's view of the best block will be height=0 and
-    // hash=0x0. This will lead to erroroneous responses for things like
-    // waitforblockheight.
-    RPCNotifyBlockChange(WITH_LOCK(chainman.GetMutex(), return chainman.ActiveTip()));
     SetRPCWarmupFinished();
 
     uiInterface.InitMessage(_("Done loading").translated);

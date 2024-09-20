@@ -29,6 +29,9 @@ add_subdirectory(util)
 if(WITH_MULTIPROCESS)
   add_subdirectory(ipc)
 endif()
+if(WITH_SV2)
+  add_subdirectory(sv2)
+endif()
 
 #=============================
 # secp256k1 subtree
@@ -296,8 +299,15 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:MiniUPnPc::MiniUPnPc>
     $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
+    $<TARGET_NAME_IF_EXISTS:bitcoin_sv2>
 )
 
+if(WITH_SV2)
+  target_compile_definitions(bitcoin_node
+  PUBLIC
+    WITH_SV2=1
+  )
+endif()
 
 # Bitcoin Core bitcoind.
 if(BUILD_DAEMON)

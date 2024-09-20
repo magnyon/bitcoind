@@ -6,11 +6,13 @@
 #define BITCOIN_INTERFACES_MINING_H
 
 #include <consensus/amount.h>       // for CAmount
+#include <interfaces/types.h>       // for BlockRef
 #include <node/types.h>             // for BlockCreateOptions
 #include <primitives/block.h>       // for CBlock, CBlockHeader
 #include <primitives/transaction.h> // for CTransactionRef
 #include <stdint.h>                 // for int64_t
 #include <uint256.h>                // for uint256
+#include <util/time.h>              // for MillisecondsDouble
 
 #include <memory>   // for unique_ptr, shared_ptr
 #include <optional> // for optional
@@ -40,6 +42,14 @@ public:
     virtual CTransactionRef getCoinbaseTx() = 0;
     virtual std::vector<unsigned char> getCoinbaseCommitment() = 0;
     virtual int getWitnessCommitmentIndex() = 0;
+    virtual std::vector<uint256> getCoinbaseMerklePath() = 0;
+
+    /**
+     * Construct and broadcast the block.
+     *
+     * @returns if the block was processed, independent of block validity
+     */
+    virtual bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CMutableTransaction coinbase) = 0;
 };
 
 //! Interface giving clients (RPC, Stratum v2 Template Provider in the future)
@@ -55,10 +65,34 @@ public:
     //! Returns whether IBD is still in progress.
     virtual bool isInitialBlockDownload() = 0;
 
-    //! Returns the hash for the tip of this chain
-    virtual std::optional<uint256> getTipHash() = 0;
+    //! Returns the hash and height for the tip of this chain
+    virtual std::optional<BlockRef> getTip() = 0;
 
     /**
+     * Waits for the tip to change
+     *
+     * @param[in] current_tip block hash of the current chain tip. Function waits
+     *                        for the chain tip to change if this matches, otherwise
+     *                        it returns right away.
+     * @param[in] timeout     how long to wait for a new tip
+     * @returns               Hash and height of the current chain tip after this call.
+     */
+    virtual BlockRef waitTipChanged(uint256 current_tip, MillisecondsDouble timeout = MillisecondsDouble::max()) = 0;
+
+    /**
+     * Waits for fees in the next block to rise, a new tip or the timeout.
+     *
+     * @param[in] timeout how long to wait for a fee increase
+     * @param[in] tip block hash that the most recent template builds on
+     * @param[in] fee_delta currently ignored: how much total fees in the next block should rise.
+     * @param[in,out] fees_before currently ignored: fees for the most recent template
+     * @param[out] tip_changed whether a new tip arrived during the wait
+     *
+     * @returns true if fees increased, false if a new tip arrives or the timeout occurs
+     */
+    virtual bool waitFeesChanged(MillisecondsDouble timeout, uint256 tip, CAmount fee_delta, CAmount& fees_before, bool& tip_changed) = 0;
+
+   /**
      * Construct a new block template
      *
      * @param[in] script_pub_key the coinbase output
