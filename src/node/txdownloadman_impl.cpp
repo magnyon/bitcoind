@@ -301,6 +301,10 @@ void TxDownloadManagerImpl::MempoolAcceptedTx(const CTransactionRef& tx)
 
 node::RejectedTxTodo TxDownloadManagerImpl::MempoolRejectedTx(const CTransactionRef& ptx, const TxValidationState& state, NodeId nodeid, bool first_time_failure)
 {
+    if (!Assume(state.IsInvalid())) {
+        return RejectedTxTodo{};
+    }
+
     const CTransaction& tx{*ptx};
     // Results returned to caller
     // Whether we should call AddToCompactExtraTransactions at the end
