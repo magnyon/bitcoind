@@ -154,6 +154,16 @@ void initialize()
         std::cerr << "No fuzz target compiled for " << g_fuzz_target << "." << std::endl;
         std::exit(EXIT_FAILURE);
     }
+
+// The FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION macro is set when BUILD_FOR_FUZZING=ON, so
+// it's used as a proxy to detect fuzzing-only build mode.
+#if !defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+    if (it->second.opts.require_build_for_fuzzing) {
+        std::cout << "The fuzz target " << g_fuzz_target << " requires BUILD_FOR_FUZZING=ON" << std::endl;
+        std::exit(EXIT_SUCCESS);
+    }
+#endif
+
     Assert(!g_test_one_input);
     g_test_one_input = &it->second.test_one_input;
     it->second.opts.init();

@@ -28,6 +28,7 @@ using TypeTestOneInput = std::function<void(FuzzBufferType)>;
 struct FuzzTargetOptions {
     std::function<void()> init{[] {}};
     bool hidden{false};
+    bool require_build_for_fuzzing{false};
 };
 
 void FuzzFrameworkRegisterTarget(std::string_view name, TypeTestOneInput target, FuzzTargetOptions opts);
