@@ -206,6 +206,8 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         self.options.timeout_factor = self.options.timeout_factor or (4 if self.options.valgrind else 1)
         self.options.previous_releases_path = previous_releases_path
 
+        if not os.path.isfile(self.options.configfile):
+            raise Exception(f"config.ini file {self.options.configfile} not found, be sure to run the build directory version of this script")
         config = configparser.ConfigParser()
         config.read_file(open(self.options.configfile))
         self.config = config
